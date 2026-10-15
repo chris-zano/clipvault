@@ -112,8 +112,7 @@ function renderHistory() {
       del.className = "danger";
       del.onclick = async (ev) => {
         ev.stopPropagation();
-        await invoke("delete_entry", { id: e.id });
-        refreshHistory();
+        await deleteEntry(e);
       };
 
       actions.append(pin);
@@ -128,6 +127,23 @@ function renderHistory() {
 
 function markSelection() {
   list.querySelectorAll(".row").forEach((el, i) => el.classList.toggle("sel", i === selected));
+}
+
+/// Deleting a history entry is immediate and unrecoverable, and an image is
+/// usually the only copy of a screenshot, so it asks first.
+async function confirmDelete(e: Entry): Promise<boolean> {
+  const what =
+    e.kind === "image"
+      ? `this image (${e.width}x${e.height})`
+      : `"${e.preview.slice(0, 60)}${e.preview.length > 60 ? "…" : ""}"`;
+  return confirm(`Delete ${what}?\n\nThis cannot be undone.`);
+}
+
+async function deleteEntry(e: Entry) {
+  if (!(await confirmDelete(e))) return;
+  await invoke("delete_entry", { id: e.id });
+  say("Deleted");
+  refreshHistory();
 }
 
 async function copy(id: number) {
@@ -305,8 +321,7 @@ document.addEventListener("keydown", async (e) => {
     refreshHistory();
   } else if (e.key === "Delete") {
     e.preventDefault();
-    await invoke("delete_entry", { id: entries[selected].id });
-    refreshHistory();
+    await deleteEntry(entries[selected]);
   }
 });
 

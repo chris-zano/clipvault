@@ -58,6 +58,27 @@ before image support is migrated in place on first open.
 gsettings set org.gnome.shell.keybindings toggle-message-tray "[]"
 ```
 
+## Command line
+
+Only one copy ever runs; launching it again signals the running one.
+
+```
+clipvault              # start in the tray, or toggle the window if running
+clipvault ui           # open the window, starting the app first if needed
+clipvault --toggle     # show, or hide if already showing
+clipvault --no-hotkey  # do not grab Super+V
+clipvault --help
+```
+
+Two ways to get Super+V, and you want exactly one of them:
+
+1. **Let the app grab it.** Clear GNOME's message-tray binding and run
+   `clipvault` with no flags.
+2. **Let the desktop own it.** Bind `clipvault ui` in Settings > Keyboard >
+   Custom Shortcuts, and run the app with `--no-hotkey` so the two do not fight
+   over the same key. More reliable, since it does not depend on the app's own
+   X grab winning the race at login.
+
 ## Keys
 
 | | |
@@ -71,11 +92,8 @@ gsettings set org.gnome.shell.keybindings toggle-message-tray "[]"
 
 Closing the window parks it in the tray. Quit from the tray menu.
 
-To start it at login:
-
-```bash
-cp /usr/share/applications/ClipVault.desktop ~/.config/autostart/
-```
+To start it at login, put a desktop entry in `~/.config/autostart/` whose
+`Exec=` is `/usr/bin/clipvault` (add `--no-hotkey` if the desktop owns Super+V).
 
 ## Testing the watcher by hand
 
@@ -99,6 +117,8 @@ hundred bytes and never exercises `INCR`.
   compositor-specific protocol.
 - Text and images (PNG, JPEG, BMP, GIF, normalised to PNG). File lists are
   skipped, as is text over 2 MB and any image over 32 MB.
+- Unpinned history is capped at 500 entries and 256 MB, oldest evicted first.
+  Pins are exempt from both; the newest entry always survives.
 - Images go in the history, not the vault, which holds text secrets only.
 - PRIMARY (mouse-select) is not captured — it would bury the list in noise.
 - Copies tagged `x-kde-passwordManagerHint: secret` are deliberately ignored.

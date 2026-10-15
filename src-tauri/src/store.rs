@@ -9,6 +9,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Unpinned entries beyond this count are dropped, oldest first. Pins never expire.
 const MAX_UNPINNED: usize = 500;
+/// Unpinned entries are also held to a byte budget, because a few dozen
+/// screenshots outweigh thousands of text clips and the count alone will not
+/// notice. Pins are exempt from both limits: keeping them is a deliberate act.
+const MAX_UNPINNED_BYTES: i64 = 256 * 1024 * 1024;
 const PREVIEW_CHARS: usize = 220;
 
 #[derive(Serialize)]
@@ -223,12 +227,33 @@ impl Store {
     }
 
     fn trim(&self) -> Result<()> {
+        self.trim_to(MAX_UNPINNED, MAX_UNPINNED_BYTES)
+    }
+
+    fn trim_to(&self, max_unpinned: usize, max_bytes: i64) -> Result<()> {
         self.conn.execute(
             "DELETE FROM entries WHERE pinned = 0 AND id NOT IN (
                  SELECT id FROM entries WHERE pinned = 0
                  ORDER BY last_used_at DESC LIMIT ?1
              )",
-            params![MAX_UNPINNED as i64],
+            params![max_unpinned as i64],
+        )?;
+
+        // Walk newest to oldest and drop everything past the budget. The sum
+        // excludes the row itself, so the most recent entry always survives even
+        // if it alone is larger than the budget - having just copied something
+        // and finding it already gone would be worse than briefly overshooting.
+        self.conn.execute(
+            "DELETE FROM entries WHERE id IN (
+                 SELECT id FROM (
+                     SELECT id, SUM(bytes) OVER (
+                         ORDER BY last_used_at DESC, id DESC
+                         ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                     ) AS preceding_bytes
+                     FROM entries WHERE pinned = 0
+                 ) WHERE preceding_bytes >= ?1
+             )",
+            params![max_bytes],
         )?;
         Ok(())
     }
@@ -600,6 +625,64 @@ mod tests {
         Store::open(&path).unwrap().record(&Clip::Text("hi".into())).unwrap();
         let s = Store::open(&path).unwrap();
         assert_eq!(s.list("", 10).unwrap().len(), 1);
+    }
+
+    /// Records an entry whose `bytes` is predictable, for budget tests.
+    fn sized(s: &Store, label: &str, bytes: usize) -> i64 {
+        let text = format!("{label}{}", "x".repeat(bytes.saturating_sub(label.len())));
+        s.record(&Clip::Text(text)).unwrap().unwrap()
+    }
+
+    #[test]
+    fn byte_budget_drops_oldest_unpinned() {
+        let (s, _d) = store();
+        let oldest = sized(&s, "a", 400);
+        let middle = sized(&s, "b", 400);
+        let newest = sized(&s, "c", 400);
+
+        // Budget counts the bytes ahead of each entry: the newest sees 0, the
+        // middle 400, the oldest 800. A 700 budget therefore keeps two.
+        s.trim_to(1000, 700).unwrap();
+
+        let left: Vec<i64> = s.list("", 10).unwrap().into_iter().map(|e| e.id).collect();
+        assert!(left.contains(&newest));
+        assert!(left.contains(&middle));
+        assert!(!left.contains(&oldest), "the oldest should go first");
+    }
+
+    #[test]
+    fn newest_entry_survives_even_if_it_alone_exceeds_the_budget() {
+        let (s, _d) = store();
+        let big = sized(&s, "big", 5000);
+        s.trim_to(1000, 100).unwrap();
+        let left = s.list("", 10).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].id, big, "copying something must not immediately lose it");
+    }
+
+    #[test]
+    fn pins_are_exempt_from_the_byte_budget() {
+        let (s, _d) = store();
+        let pinned = sized(&s, "keep", 5000);
+        s.set_pinned(pinned, true).unwrap();
+        for i in 0..5 {
+            sized(&s, &format!("junk{i}"), 2000);
+        }
+        s.trim_to(1000, 1000).unwrap();
+
+        let left = s.list("", 20).unwrap();
+        assert!(left.iter().any(|e| e.id == pinned), "a pin outlives the budget");
+    }
+
+    #[test]
+    fn budget_and_count_limits_both_apply() {
+        let (s, _d) = store();
+        for i in 0..20 {
+            sized(&s, &format!("e{i}"), 100);
+        }
+        // Count allows 5, budget allows about 3.
+        s.trim_to(5, 300).unwrap();
+        assert!(s.list("", 50).unwrap().len() <= 3);
     }
 
     #[test]

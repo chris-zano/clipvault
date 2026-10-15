@@ -23,15 +23,64 @@ fn default_shortcut() -> Shortcut {
     Shortcut::new(Some(Modifiers::SUPER), Code::KeyV)
 }
 
+/// What a command line asked for. A second launch does not start a second
+/// copy; it tells the running one what to do.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Intent {
+    /// Sit in the tray. What autostart wants.
+    Daemon,
+    /// Bring the window up.
+    Ui,
+    /// Show it, or hide it if it is already up.
+    Toggle,
+}
+
+fn intent_of<S: AsRef<str>>(args: &[S]) -> Intent {
+    for a in args {
+        match a.as_ref() {
+            "ui" | "--ui" => return Intent::Ui,
+            "--toggle" | "-t" => return Intent::Toggle,
+            _ => {}
+        }
+    }
+    Intent::Daemon
+}
+
+const HELP: &str = "\
+ClipVault - clipboard history with an encrypted secrets vault
+
+USAGE:
+    clipvault [COMMAND] [OPTIONS]
+
+COMMANDS:
+    (none)          Start in the system tray, or toggle the window if already
+                    running. This is what an autostart entry should use.
+    ui              Open the window, starting the app first if needed.
+
+OPTIONS:
+    -t, --toggle    Show the window, or hide it if it is already showing.
+        --no-hotkey Do not register Super+V. Use this when the desktop's own
+                    keyboard settings are bound to `clipvault ui` instead,
+                    so the two do not fight over the same key.
+    -h, --help      Print this help.
+
+Only one copy ever runs. Launching it again signals the running one.
+";
+
+fn show_window(app: &AppHandle) {
+    let Some(win) = app.get_webview_window("main") else { return };
+    let _ = win.center();
+    let _ = win.show();
+    let _ = win.set_focus();
+    let _ = app.emit("window-shown", ());
+}
+
 fn toggle_window(app: &AppHandle) {
     let Some(win) = app.get_webview_window("main") else { return };
     if win.is_visible().unwrap_or(false) {
         let _ = win.hide();
     } else {
-        let _ = win.center();
-        let _ = win.show();
-        let _ = win.set_focus();
-        let _ = app.emit("window-shown", ());
+        show_window(app);
     }
 }
 
@@ -40,10 +89,58 @@ pub fn media_to_rgba(png: &[u8]) -> anyhow::Result<(u32, u32, Vec<u8>)> {
     media::to_rgba(png)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{intent_of, Intent};
+
+    #[test]
+    fn no_arguments_means_sit_in_the_tray() {
+        let none: [&str; 0] = [];
+        assert!(intent_of(&none) == Intent::Daemon);
+        // Flags that are not commands must not change that.
+        assert!(intent_of(&["--no-hotkey"]) == Intent::Daemon);
+    }
+
+    #[test]
+    fn ui_and_toggle_are_recognised() {
+        assert!(intent_of(&["ui"]) == Intent::Ui);
+        assert!(intent_of(&["--ui"]) == Intent::Ui);
+        assert!(intent_of(&["--toggle"]) == Intent::Toggle);
+        assert!(intent_of(&["-t"]) == Intent::Toggle);
+    }
+
+    #[test]
+    fn a_command_is_found_among_other_flags() {
+        assert!(intent_of(&["--no-hotkey", "ui"]) == Intent::Ui);
+    }
+
+    #[test]
+    fn unknown_arguments_fall_back_to_the_daemon() {
+        assert!(intent_of(&["--what", "nonsense"]) == Intent::Daemon);
+    }
+}
+
 pub fn run() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print!("{HELP}");
+        return;
+    }
+    let intent = intent_of(&args);
+    let want_hotkey = !args.iter().any(|a| a == "--no-hotkey");
+
     tauri::Builder::default()
+        // Must come first: it decides whether this process is the one that
+        // keeps running, before anything else sets itself up.
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            // Runs inside the ALREADY RUNNING copy when another launch happens.
+            match intent_of(&argv[1..]) {
+                Intent::Ui => show_window(app),
+                _ => toggle_window(app),
+            }
+        }))
         .invoke_handler(tauri::generate_handler![
             commands::list_entries,
             commands::copy_entry,
@@ -62,7 +159,7 @@ pub fn run() {
             commands::vault_copy,
             commands::vault_delete,
         ])
-        .setup(|app| {
+        .setup(move |app| {
             let handle = app.handle().clone();
 
             let db_path = app.path().app_data_dir()?.join("clipvault.db");
@@ -176,8 +273,20 @@ pub fn run() {
                     })
                     .build(),
             )?;
-            if let Err(e) = app.global_shortcut().register(shortcut) {
-                log::warn!("could not register Super+V ({e}); open from the tray icon instead");
+            if want_hotkey {
+                if let Err(e) = app.global_shortcut().register(shortcut) {
+                    log::warn!(
+                        "could not register Super+V ({e}); \
+                         bind `clipvault ui` in your desktop's keyboard settings, \
+                         or open from the tray icon"
+                    );
+                }
+            } else {
+                log::info!("skipping Super+V; expecting the desktop to bind `clipvault ui`");
+            }
+
+            if intent != Intent::Daemon {
+                show_window(&handle);
             }
 
             Ok(())
