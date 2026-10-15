@@ -4,6 +4,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 
 type Entry = {
   id: number;
+  kind: "text" | "image";
   preview: string;
   truncated: boolean;
   bytes: number;
@@ -11,6 +12,9 @@ type Entry = {
   created_at: number;
   last_used_at: number;
   use_count: number;
+  width: number | null;
+  height: number | null;
+  thumb: string | null;
 };
 
 type VaultItem = { id: number; label: string; created_at: number };
@@ -64,8 +68,18 @@ function renderHistory() {
       li.className = "row" + (i === selected ? " sel" : "");
       li.tabIndex = -1;
 
+      if (e.kind === "image" && e.thumb) {
+        const thumb = document.createElement("img");
+        thumb.className = "thumb";
+        thumb.src = e.thumb;
+        thumb.alt = e.preview;
+        thumb.title = "Click to copy";
+        thumb.onclick = () => copy(e.id);
+        li.append(thumb);
+      }
+
       const text = document.createElement("span");
-      text.className = "text";
+      text.className = "text" + (e.kind === "image" ? " image" : "");
       text.textContent = e.preview + (e.truncated ? " …" : "");
       text.title = "Click to copy";
       text.onclick = () => copy(e.id);
@@ -102,7 +116,9 @@ function renderHistory() {
         refreshHistory();
       };
 
-      actions.append(pin, stash, del);
+      actions.append(pin);
+      if (e.kind === "text") actions.append(stash);
+      actions.append(del);
       li.append(text, meta, actions);
       li.onmouseenter = () => { selected = i; markSelection(); };
       return li;

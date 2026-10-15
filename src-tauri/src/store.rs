@@ -1,4 +1,6 @@
+use crate::media::{human_size, ImageClip};
 use anyhow::Result;
+use base64::Engine;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -12,6 +14,7 @@ const PREVIEW_CHARS: usize = 220;
 #[derive(Serialize)]
 pub struct Entry {
     pub id: i64,
+    pub kind: String,
     pub preview: String,
     pub truncated: bool,
     pub bytes: i64,
@@ -19,6 +22,25 @@ pub struct Entry {
     pub created_at: i64,
     pub last_used_at: i64,
     pub use_count: i64,
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+    /// Data URL for the list thumbnail; images only.
+    pub thumb: Option<String>,
+}
+
+/// Something worth remembering off the clipboard.
+pub enum Clip {
+    Text(String),
+    Image(ImageClip),
+}
+
+impl Clip {
+    pub fn hash(&self) -> String {
+        match self {
+            Clip::Text(t) => hash_of(t),
+            Clip::Image(i) => i.hash.clone(),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -104,17 +126,44 @@ impl Store {
             );
             "#,
         )?;
+        self.add_image_columns()?;
+        Ok(())
+    }
+
+    /// Images arrived after the first release, so the columns are added to
+    /// whatever table is already on disk rather than assumed present.
+    fn add_image_columns(&self) -> Result<()> {
+        let existing: Vec<String> = self
+            .conn
+            .prepare("SELECT name FROM pragma_table_info('entries')")?
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+
+        for (name, decl) in [
+            ("kind", "TEXT NOT NULL DEFAULT 'text'"),
+            ("blob", "BLOB"),
+            ("thumb", "BLOB"),
+            ("width", "INTEGER"),
+            ("height", "INTEGER"),
+        ] {
+            if !existing.iter().any(|c| c == name) {
+                self.conn
+                    .execute(&format!("ALTER TABLE entries ADD COLUMN {name} {decl}"), [])?;
+            }
+        }
         Ok(())
     }
 
     // ---- history -------------------------------------------------------
 
-    /// Returns the row id, or None when the text was empty/whitespace only.
-    pub fn record(&self, text: &str) -> Result<Option<i64>> {
-        if text.trim().is_empty() {
-            return Ok(None);
+    /// Returns the row id, or None when there was nothing worth keeping.
+    pub fn record(&self, clip: &Clip) -> Result<Option<i64>> {
+        if let Clip::Text(t) = clip {
+            if t.trim().is_empty() {
+                return Ok(None);
+            }
         }
-        let hash = hash_of(text);
+        let hash = clip.hash();
         let ts = now();
 
         // Re-copying something already in history moves it back to the top
@@ -132,12 +181,42 @@ impl Store {
             return Ok(Some(id));
         }
 
-        let (preview, truncated) = preview_of(text);
-        self.conn.execute(
-            "INSERT INTO entries (content, hash, preview, truncated, bytes, created_at, last_used_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
-            params![text, hash, preview, truncated as i64, text.len() as i64, ts],
-        )?;
+        match clip {
+            Clip::Text(text) => {
+                let (preview, truncated) = preview_of(text);
+                self.conn.execute(
+                    "INSERT INTO entries
+                       (kind, content, hash, preview, truncated, bytes, created_at, last_used_at)
+                     VALUES ('text', ?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+                    params![text, hash, preview, truncated as i64, text.len() as i64, ts],
+                )?;
+            }
+            Clip::Image(img) => {
+                let preview = format!(
+                    "Image {}x{} - {}",
+                    img.width,
+                    img.height,
+                    human_size(img.png.len())
+                );
+                self.conn.execute(
+                    "INSERT INTO entries
+                       (kind, content, hash, preview, truncated, bytes, created_at, last_used_at,
+                        blob, thumb, width, height)
+                     VALUES ('image', '', ?1, ?2, 0, ?3, ?4, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        hash,
+                        preview,
+                        img.png.len() as i64,
+                        ts,
+                        img.png,
+                        img.thumb_png,
+                        img.width as i64,
+                        img.height as i64
+                    ],
+                )?;
+            }
+        }
+
         let id = self.conn.last_insert_rowid();
         self.trim()?;
         Ok(Some(id))
@@ -161,7 +240,8 @@ impl Store {
         // would never match.
         let (sql, like) = if q.is_empty() {
             (
-                "SELECT id, preview, truncated, bytes, pinned, created_at, last_used_at, use_count
+                "SELECT id, kind, preview, truncated, bytes, pinned, created_at, last_used_at,
+                        use_count, width, height, thumb
                  FROM entries
                  ORDER BY pinned DESC, last_used_at DESC LIMIT ?1"
                     .to_string(),
@@ -169,9 +249,10 @@ impl Store {
             )
         } else {
             (
-                "SELECT id, preview, truncated, bytes, pinned, created_at, last_used_at, use_count
+                "SELECT id, kind, preview, truncated, bytes, pinned, created_at, last_used_at,
+                        use_count, width, height, thumb
                  FROM entries
-                 WHERE content LIKE ?2 ESCAPE '\\'
+                 WHERE (content LIKE ?2 ESCAPE '\\' OR (kind = 'image' AND preview LIKE ?2 ESCAPE '\\'))
                  ORDER BY pinned DESC, last_used_at DESC LIMIT ?1"
                     .to_string(),
                 Some(format!(
@@ -183,15 +264,25 @@ impl Store {
 
         let mut stmt = self.conn.prepare(&sql)?;
         let map = |r: &rusqlite::Row| -> rusqlite::Result<Entry> {
+            let thumb: Option<Vec<u8>> = r.get(11)?;
             Ok(Entry {
                 id: r.get(0)?,
-                preview: r.get(1)?,
-                truncated: r.get::<_, i64>(2)? != 0,
-                bytes: r.get(3)?,
-                pinned: r.get::<_, i64>(4)? != 0,
-                created_at: r.get(5)?,
-                last_used_at: r.get(6)?,
-                use_count: r.get(7)?,
+                kind: r.get(1)?,
+                preview: r.get(2)?,
+                truncated: r.get::<_, i64>(3)? != 0,
+                bytes: r.get(4)?,
+                pinned: r.get::<_, i64>(5)? != 0,
+                created_at: r.get(6)?,
+                last_used_at: r.get(7)?,
+                use_count: r.get(8)?,
+                width: r.get(9)?,
+                height: r.get(10)?,
+                thumb: thumb.map(|b| {
+                    format!(
+                        "data:image/png;base64,{}",
+                        base64::engine::general_purpose::STANDARD.encode(b)
+                    )
+                }),
             })
         };
         let rows = match like {
@@ -205,6 +296,25 @@ impl Store {
         Ok(self
             .conn
             .query_row("SELECT content FROM entries WHERE id = ?1", params![id], |r| r.get(0))
+            .optional()?)
+    }
+
+    pub fn image_png(&self, id: i64) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT blob FROM entries WHERE id = ?1 AND kind = 'image'",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    pub fn kind(&self, id: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT kind FROM entries WHERE id = ?1", params![id], |r| r.get(0))
             .optional()?)
     }
 
@@ -312,23 +422,23 @@ mod tests {
     #[test]
     fn records_and_reads_back() {
         let (s, _d) = store();
-        let id = s.record("hello world").unwrap().unwrap();
+        let id = s.record(&Clip::Text("hello world".into())).unwrap().unwrap();
         assert_eq!(s.content(id).unwrap().as_deref(), Some("hello world"));
     }
 
     #[test]
     fn ignores_blank_copies() {
         let (s, _d) = store();
-        assert!(s.record("   \n\t ").unwrap().is_none());
+        assert!(s.record(&Clip::Text("   \n\t ".into())).unwrap().is_none());
         assert_eq!(s.list("", 10).unwrap().len(), 0);
     }
 
     #[test]
     fn recopying_moves_to_top_instead_of_duplicating() {
         let (s, _d) = store();
-        let first = s.record("repeated").unwrap().unwrap();
-        s.record("other").unwrap();
-        let again = s.record("repeated").unwrap().unwrap();
+        let first = s.record(&Clip::Text("repeated".into())).unwrap().unwrap();
+        s.record(&Clip::Text("other".into())).unwrap();
+        let again = s.record(&Clip::Text("repeated".into())).unwrap().unwrap();
 
         assert_eq!(first, again, "same text should reuse the row");
         let rows = s.list("", 10).unwrap();
@@ -340,8 +450,8 @@ mod tests {
     #[test]
     fn search_matches_inside_words() {
         let (s, _d) = store();
-        s.record("https://example.com/p?token=AKIAIOSFODNN7EXAMPLE").unwrap();
-        s.record("nothing to see").unwrap();
+        s.record(&Clip::Text("https://example.com/p?token=AKIAIOSFODNN7EXAMPLE".into())).unwrap();
+        s.record(&Clip::Text("nothing to see".into())).unwrap();
 
         // The substring is mid-token - a word tokenizer would miss this.
         assert_eq!(s.list("AKIA", 10).unwrap().len(), 1);
@@ -352,8 +462,8 @@ mod tests {
     #[test]
     fn search_treats_wildcards_literally() {
         let (s, _d) = store();
-        s.record("plain text").unwrap();
-        s.record("50% off").unwrap();
+        s.record(&Clip::Text("plain text".into())).unwrap();
+        s.record(&Clip::Text("50% off".into())).unwrap();
         // '%' must not act as a LIKE wildcard matching everything.
         let hits = s.list("%", 10).unwrap();
         assert_eq!(hits.len(), 1);
@@ -363,8 +473,8 @@ mod tests {
     #[test]
     fn pinned_entries_sort_first_and_survive_clear() {
         let (s, _d) = store();
-        let old = s.record("pin me").unwrap().unwrap();
-        s.record("newer").unwrap();
+        let old = s.record(&Clip::Text("pin me".into())).unwrap().unwrap();
+        s.record(&Clip::Text("newer".into())).unwrap();
         s.set_pinned(old, true).unwrap();
 
         assert_eq!(s.list("", 10).unwrap()[0].id, old);
@@ -381,21 +491,122 @@ mod tests {
     #[test]
     fn trim_drops_oldest_unpinned_but_keeps_pins() {
         let (s, _d) = store();
-        let pinned = s.record("keep forever").unwrap().unwrap();
+        let pinned = s.record(&Clip::Text("keep forever".into())).unwrap().unwrap();
         s.set_pinned(pinned, true).unwrap();
         for i in 0..MAX_UNPINNED + 25 {
-            s.record(&format!("entry {i}")).unwrap();
+            s.record(&Clip::Text(format!("entry {i}"))).unwrap();
         }
         let all = s.list("", 2000).unwrap();
         assert_eq!(all.len(), MAX_UNPINNED + 1, "pin plus the capped unpinned set");
         assert!(all.iter().any(|e| e.id == pinned));
     }
 
+    fn image_clip(w: u32, h: u32, shade: u8) -> Clip {
+        use std::io::Cursor;
+        let img = image::RgbaImage::from_fn(w, h, |x, _| {
+            image::Rgba([shade, (x % 256) as u8, 64, 255])
+        });
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        Clip::Image(crate::media::prepare(&png).unwrap())
+    }
+
+    #[test]
+    fn records_an_image_with_dimensions_and_thumbnail() {
+        let (s, _d) = store();
+        let id = s.record(&image_clip(120, 80, 5)).unwrap().unwrap();
+        let row = s.list("", 10).unwrap().into_iter().find(|e| e.id == id).unwrap();
+
+        assert_eq!(row.kind, "image");
+        assert_eq!((row.width, row.height), (Some(120), Some(80)));
+        assert!(row.preview.contains("120x80"));
+        assert!(row.thumb.unwrap().starts_with("data:image/png;base64,"));
+        assert!(s.image_png(id).unwrap().is_some());
+    }
+
+    #[test]
+    fn recopying_an_image_does_not_duplicate_it() {
+        let (s, _d) = store();
+        let first = s.record(&image_clip(60, 60, 9)).unwrap().unwrap();
+        let again = s.record(&image_clip(60, 60, 9)).unwrap().unwrap();
+        assert_eq!(first, again);
+        assert_eq!(s.list("", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn images_and_text_coexist() {
+        let (s, _d) = store();
+        s.record(&Clip::Text("some text".into())).unwrap();
+        s.record(&image_clip(40, 40, 2)).unwrap();
+        let rows = s.list("", 10).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.iter().filter(|e| e.kind == "image").count(), 1);
+    }
+
+    #[test]
+    fn searching_for_image_finds_image_rows_only() {
+        let (s, _d) = store();
+        s.record(&Clip::Text("ordinary text".into())).unwrap();
+        s.record(&image_clip(40, 40, 2)).unwrap();
+        let hits = s.list("Image", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].kind, "image");
+    }
+
+    #[test]
+    fn text_search_does_not_match_image_blobs() {
+        let (s, _d) = store();
+        s.record(&image_clip(40, 40, 2)).unwrap();
+        // Images store an empty content string; a search must not match them
+        // just because the LIKE pattern is permissive.
+        assert_eq!(s.list("ordinary", 10).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn opens_a_database_written_before_images_existed() {
+        let dir = tempdir::Dir::new();
+        let path = dir.path().join("old.db");
+        {
+            let c = rusqlite::Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE entries (
+                     id INTEGER PRIMARY KEY, content TEXT NOT NULL, hash TEXT NOT NULL UNIQUE,
+                     preview TEXT NOT NULL, truncated INTEGER NOT NULL DEFAULT 0,
+                     bytes INTEGER NOT NULL, pinned INTEGER NOT NULL DEFAULT 0,
+                     created_at INTEGER NOT NULL, last_used_at INTEGER NOT NULL,
+                     use_count INTEGER NOT NULL DEFAULT 0);
+                 INSERT INTO entries (content, hash, preview, bytes, created_at, last_used_at)
+                 VALUES ('from the old schema', 'oldhash', 'from the old schema', 19, 1, 1);",
+            )
+            .unwrap();
+        }
+
+        let s = Store::open(&path).unwrap();
+        let rows = s.list("", 10).unwrap();
+        assert_eq!(rows.len(), 1, "the existing entry survives the migration");
+        assert_eq!(rows[0].kind, "text", "rows written before images default to text");
+
+        // And the upgraded table takes images.
+        s.record(&image_clip(30, 30, 1)).unwrap();
+        assert_eq!(s.list("", 10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn migration_is_idempotent() {
+        let dir = tempdir::Dir::new();
+        let path = dir.path().join("twice.db");
+        Store::open(&path).unwrap().record(&Clip::Text("hi".into())).unwrap();
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.list("", 10).unwrap().len(), 1);
+    }
+
     #[test]
     fn preview_is_truncated_and_flagged() {
         let (s, _d) = store();
         let long = "x".repeat(PREVIEW_CHARS + 50);
-        let id = s.record(&long).unwrap().unwrap();
+        let id = s.record(&Clip::Text(long.clone())).unwrap().unwrap();
         let row = s.list("", 10).unwrap().into_iter().find(|e| e.id == id).unwrap();
         assert!(row.truncated);
         assert_eq!(row.preview.chars().count(), PREVIEW_CHARS);

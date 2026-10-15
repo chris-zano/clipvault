@@ -13,7 +13,11 @@ It watches the X11 CLIPBOARD selection through XFixes rather than hooking keys.
 Ctrl+C, Ctrl+X, a context menu, an in-app copy button and `xdotool` all change
 the selection owner, so all of them are captured, and nothing reads the keyboard.
 
-Two details that are easy to get wrong and cost real debugging here:
+Text and images are both captured, screenshots included. Text wins when an app
+offers both, since copying a file or rich content offers an image alongside the
+text you actually wanted.
+
+Three details that are easy to get wrong and cost real debugging here:
 
 - A `ConvertSelection` must carry a timestamp the owner accepts, and owners may
   refuse one that predates their ownership. `server_time()` in `watcher.rs` asks
@@ -45,13 +49,20 @@ npm run tauri build      # .deb and AppImage in src-tauri/target/release/bundle
 cargo test --lib --manifest-path src-tauri/Cargo.toml
 ```
 
-Data lives in `~/.local/share/dev.local.clipvault/clipvault.db`.
+Data lives in `~/.local/share/dev.local.clipvault/clipvault.db`. A database from
+before image support is migrated in place on first open.
+
+`Super+V` is GNOME's message-tray binding out of the box. Clear it with:
+
+```bash
+gsettings set org.gnome.shell.keybindings toggle-message-tray "[]"
+```
 
 ## Keys
 
 | | |
 |---|---|
-| `Super+Shift+V` | show/hide (global; Super+V is GNOME's message tray) |
+| `Super+V` | show/hide (global) |
 | `↑` `↓` `Enter` | navigate, copy and close |
 | `Ctrl+P` | pin or unpin |
 | `Delete` | remove entry |
@@ -68,14 +79,20 @@ owner refuses our `ConvertSelection` even though real GTK/Qt apps serve it, whic
 makes it look like the watcher is broken when it is not.
 
 ```bash
-python3 scripts/gtkcopy.py "hello"   # then check the history list
+python3 scripts/gtkcopy.py "hello"          # text
+python3 scripts/gtkcopyimage.py 1200 900    # large image, forces an INCR transfer
+python3 scripts/gtkpasteimage.py            # read an image back
 ```
+
+`gtkcopyimage.py` uses random pixels on purpose: a solid fill compresses to a few
+hundred bytes and never exercises `INCR`.
 
 ## Limits
 
 - X11 only. Wayland has no equivalent of this API; it needs a portal or a
   compositor-specific protocol.
-- Text only. Images and file lists are skipped, as are payloads over 2 MB and
-  `INCR` transfers.
+- Text and images (PNG, JPEG, BMP, GIF, normalised to PNG). File lists are
+  skipped, as is text over 2 MB and any image over 32 MB.
+- Images go in the history, not the vault, which holds text secrets only.
 - PRIMARY (mouse-select) is not captured — it would bury the list in noise.
 - Copies tagged `x-kde-passwordManagerHint: secret` are deliberately ignored.

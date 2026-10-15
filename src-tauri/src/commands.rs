@@ -2,6 +2,7 @@ use serde::Serialize;
 use std::sync::{Arc, Mutex};
 use tauri::State;
 
+use crate::media;
 use crate::store::{Entry, Store, VaultItem};
 use crate::vault::{Vault, AUTO_LOCK_MINUTES};
 use crate::watcher::Suppressor;
@@ -31,6 +32,19 @@ impl App {
     fn put_on_clipboard(&self, text: &str) -> Result<(), String> {
         self.clipboard.lock().unwrap().set_text(text).map_err(err)
     }
+
+    fn put_image_on_clipboard(&self, png: &[u8]) -> Result<(), String> {
+        let (w, h, rgba) = media::to_rgba(png).map_err(err)?;
+        self.clipboard
+            .lock()
+            .unwrap()
+            .set_image(arboard::ImageData {
+                width: w as usize,
+                height: h as usize,
+                bytes: rgba.into(),
+            })
+            .map_err(err)
+    }
 }
 
 // ---- history ------------------------------------------------------------
@@ -42,14 +56,31 @@ pub fn list_entries(app: State<'_, App>, query: String, limit: i64) -> Out<Vec<E
 
 #[tauri::command]
 pub fn copy_entry(app: State<'_, App>, id: i64) -> Out<()> {
-    let content = {
+    let kind = {
         let store = app.store.lock().unwrap();
-        store.content(id).map_err(err)?.ok_or("entry no longer exists")?
+        store.kind(id).map_err(err)?.ok_or("entry no longer exists")?
     };
-    // Tell the watcher to ignore the selection change we are about to cause,
-    // otherwise pasting from history re-records the same text.
-    app.suppress.expect(&content);
-    app.put_on_clipboard(&content)?;
+
+    if kind == "image" {
+        let png = {
+            let store = app.store.lock().unwrap();
+            store.image_png(id).map_err(err)?.ok_or("image is missing")?
+        };
+        // The hash is over pixels, so it still matches after arboard re-encodes
+        // the image on its way back onto the clipboard.
+        let clip = media::prepare(&png).map_err(err)?;
+        app.suppress.expect_hash(&clip.hash);
+        app.put_image_on_clipboard(&png)?;
+    } else {
+        let content = {
+            let store = app.store.lock().unwrap();
+            store.content(id).map_err(err)?.ok_or("entry no longer exists")?
+        };
+        // Tell the watcher to ignore the selection change we are about to cause,
+        // otherwise pasting from history re-records the same text.
+        app.suppress.expect(&content);
+        app.put_on_clipboard(&content)?;
+    }
     app.store.lock().unwrap().mark_used(id).map_err(err)
 }
 
@@ -145,6 +176,9 @@ pub fn vault_absorb_entry(app: State<'_, App>, id: i64, label: String) -> Out<i6
     }
     let content = {
         let store = app.store.lock().unwrap();
+        if store.kind(id).map_err(err)?.as_deref() == Some("image") {
+            return Err("the vault holds text secrets, not images".into());
+        }
         store.content(id).map_err(err)?.ok_or("entry no longer exists")?
     };
     let vault = app.vault_checked();

@@ -1,4 +1,5 @@
 mod commands;
+mod media;
 mod store;
 mod vault;
 mod watcher;
@@ -12,14 +13,14 @@ use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
 use commands::App;
-use store::Store;
+use store::{Clip, Store};
 use vault::{Vault, AUTO_LOCK_MINUTES};
-use watcher::Suppressor;
+use watcher::{Captured, Suppressor};
 
-/// Super+V is taken by the GNOME message tray, so the default sits one
-/// modifier away from it.
+/// Super+V. GNOME binds this to the message tray out of the box; clearing that
+/// binding is part of installing this app, see README.
 fn default_shortcut() -> Shortcut {
-    Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::KeyV)
+    Shortcut::new(Some(Modifiers::SUPER), Code::KeyV)
 }
 
 fn toggle_window(app: &AppHandle) {
@@ -32,6 +33,11 @@ fn toggle_window(app: &AppHandle) {
         let _ = win.set_focus();
         let _ = app.emit("window-shown", ());
     }
+}
+
+/// Re-exported so the `setclipimage` example can exercise the copy-back path.
+pub fn media_to_rgba(png: &[u8]) -> anyhow::Result<(u32, u32, Vec<u8>)> {
+    media::to_rgba(png)
 }
 
 pub fn run() {
@@ -72,16 +78,33 @@ pub fn run() {
 
             // Clipboard watcher -> store, on two threads so neither X nor
             // SQLite can stall the UI.
-            let (tx, rx) = mpsc::channel::<String>();
-            watcher::spawn(tx, suppress);
+            let (tx, rx) = mpsc::channel::<Captured>();
+            watcher::spawn(tx);
 
+            // Decoding and hashing happen here rather than on the X thread, so a
+            // multi-megabyte screenshot cannot delay the next capture.
             let recorder = handle.clone();
+            let recorder_suppress = suppress.clone();
             std::thread::Builder::new()
                 .name("clipboard-recorder".into())
                 .spawn(move || {
-                    while let Ok(text) = rx.recv() {
+                    while let Ok(captured) = rx.recv() {
+                        let clip = match captured {
+                            Captured::Text(t) => Clip::Text(t),
+                            Captured::Image(bytes) => match media::prepare(&bytes) {
+                                Ok(img) => Clip::Image(img),
+                                Err(e) => {
+                                    log::warn!("ignoring unreadable image on clipboard: {e}");
+                                    continue;
+                                }
+                            },
+                        };
+                        if recorder_suppress.should_skip(&clip.hash()) {
+                            continue;
+                        }
+
                         let state = recorder.state::<App>();
-                        let result = state.store.lock().unwrap().record(&text);
+                        let result = state.store.lock().unwrap().record(&clip);
                         match result {
                             Ok(Some(_)) => {
                                 let _ = recorder.emit("history-changed", ());
@@ -154,9 +177,7 @@ pub fn run() {
                     .build(),
             )?;
             if let Err(e) = app.global_shortcut().register(shortcut) {
-                log::warn!(
-                    "could not register Super+Shift+V ({e}); open from the tray icon instead"
-                );
+                log::warn!("could not register Super+V ({e}); open from the tray icon instead");
             }
 
             Ok(())

@@ -9,14 +9,14 @@
 use anyhow::{anyhow, bail, Result};
 use std::collections::VecDeque;
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use x11rb::connection::Connection;
 use x11rb::protocol::xfixes::{self, ConnectionExt as XfixesConnectionExt, SelectionEventMask};
 use x11rb::protocol::xproto::{
     Atom, AtomEnum, ConnectionExt as XprotoConnectionExt, CreateWindowAux, EventMask, PropMode,
-    SelectionNotifyEvent, Window, WindowClass,
+    Property, SelectionNotifyEvent, Window, WindowClass,
 };
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
@@ -25,8 +25,19 @@ use x11rb::wrapper::ConnectionExt as _;
 use crate::store::hash_of;
 
 const FETCH_TIMEOUT: Duration = Duration::from_millis(500);
+/// A whole INCR transfer gets longer than a single round trip; a full-screen
+/// screenshot arrives in a few hundred chunks.
+const INCR_TIMEOUT: Duration = Duration::from_secs(10);
 /// Anything larger is almost certainly not something you want in a history list.
-const MAX_BYTES: usize = 2 * 1024 * 1024;
+const MAX_TEXT_BYTES: usize = 2 * 1024 * 1024;
+/// Generous enough for a 4K screenshot.
+const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
+
+/// What came off the clipboard, still undecoded.
+pub enum Captured {
+    Text(String),
+    Image(Vec<u8>),
+}
 
 /// Lets the app suppress capture of clipboard writes it made itself, so that
 /// pasting from history does not create a duplicate entry and a secret copied
@@ -39,8 +50,13 @@ pub struct Suppressor {
 impl Suppressor {
     /// Skip the next capture only if its content matches `text`.
     pub fn expect(&self, text: &str) {
+        self.expect_hash(&hash_of(text));
+    }
+
+    /// Skip the next capture only if it hashes to `hash`.
+    pub fn expect_hash(&self, hash: &str) {
         *self.inner.lock().unwrap() =
-            Some((Some(hash_of(text)), Instant::now() + Duration::from_secs(3)));
+            Some((Some(hash.to_string()), Instant::now() + Duration::from_secs(3)));
     }
 
     /// Skip the next capture whatever it contains. Used for vault secrets.
@@ -48,7 +64,7 @@ impl Suppressor {
         *self.inner.lock().unwrap() = Some((None, Instant::now() + Duration::from_secs(3)));
     }
 
-    fn should_skip(&self, hash: &str) -> bool {
+    pub fn should_skip(&self, hash: &str) -> bool {
         let mut guard = self.inner.lock().unwrap();
         // The deadline keeps a suppression that never fired from swallowing an
         // unrelated copy later on.
@@ -78,6 +94,7 @@ struct Atoms {
     time_probe: Atom,
     password_hint: Atom,
     text_targets: Vec<Atom>,
+    image_targets: Vec<Atom>,
 }
 
 struct Watcher {
@@ -127,6 +144,12 @@ impl Watcher {
                 intern(&conn, "UTF8_STRING")?,
                 intern(&conn, "text/plain")?,
                 Atom::from(AtomEnum::STRING),
+            ],
+            image_targets: vec![
+                intern(&conn, "image/png")?,
+                intern(&conn, "image/jpeg")?,
+                intern(&conn, "image/bmp")?,
+                intern(&conn, "image/gif")?,
             ],
         };
 
@@ -230,20 +253,76 @@ impl Watcher {
                 return Ok(None);
             }
 
+            // Peek without deleting: an INCR handshake needs the delete to be
+            // the signal that we are ready for the first chunk.
             let reply = self
                 .conn
-                .get_property(true, self.win, self.atoms.prop, AtomEnum::ANY, 0, 0x1FFF_FFFF)?
+                .get_property(false, self.win, self.atoms.prop, AtomEnum::ANY, 0, 0x1FFF_FFFF)?
                 .reply()?;
 
             if reply.type_ == self.atoms.incr {
-                // Incremental transfers are only used for very large payloads,
-                // which we would discard on size anyway.
-                log::debug!("skipping INCR clipboard transfer");
-                return Ok(None);
+                self.conn.delete_property(self.win, self.atoms.prop)?;
+                self.conn.flush()?;
+                return self.read_incr();
             }
+
+            self.conn.delete_property(self.win, self.atoms.prop)?;
+            self.conn.flush()?;
             return Ok(Some(reply.value));
         }
         Ok(None)
+    }
+
+    /// Reads an incremental transfer. The owner writes one chunk at a time and
+    /// waits for us to delete the property before writing the next; a
+    /// zero-length chunk ends it. Large images always arrive this way, because
+    /// they do not fit in a single property.
+    fn read_incr(&mut self) -> Result<Option<Vec<u8>>> {
+        let deadline = Instant::now() + INCR_TIMEOUT;
+        let mut out: Vec<u8> = Vec::new();
+
+        loop {
+            if !self.await_property_notify(deadline)? {
+                log::warn!("incremental clipboard transfer stalled");
+                return Ok(None);
+            }
+            let chunk = self
+                .conn
+                .get_property(true, self.win, self.atoms.prop, AtomEnum::ANY, 0, 0x1FFF_FFFF)?
+                .reply()?;
+            // Deleting the property is what tells the owner to send the next one.
+            self.conn.flush()?;
+
+            if chunk.value.is_empty() {
+                log::debug!("incremental transfer complete: {} bytes", out.len());
+                return Ok(Some(out));
+            }
+            out.extend_from_slice(&chunk.value);
+            if out.len() > MAX_IMAGE_BYTES {
+                log::debug!("abandoning oversized incremental transfer");
+                return Ok(None);
+            }
+        }
+    }
+
+    /// Waits for the owner to write the next INCR chunk onto our property.
+    fn await_property_notify(&mut self, deadline: Instant) -> Result<bool> {
+        loop {
+            if Instant::now() > deadline {
+                return Ok(false);
+            }
+            match self.conn.poll_for_event()? {
+                Some(Event::PropertyNotify(e))
+                    if e.window == self.win
+                        && e.atom == self.atoms.prop
+                        && e.state == Property::NEW_VALUE =>
+                {
+                    return Ok(true)
+                }
+                Some(other) => self.queued.push_back(other),
+                None => std::thread::sleep(Duration::from_millis(2)),
+            }
+        }
     }
 
     fn targets(&mut self) -> Result<Vec<Atom>> {
@@ -257,9 +336,10 @@ impl Watcher {
             .collect())
     }
 
-    /// Returns the clipboard text, or None when it holds something we skip:
-    /// non-text content, an oversized payload, or a password manager's secret.
-    fn read_text(&mut self) -> Result<Option<String>> {
+    /// Returns whatever is worth keeping, or None when the clipboard holds
+    /// something we skip: an unsupported format, an oversized payload, or a
+    /// password manager's secret.
+    fn read_clip(&mut self) -> Result<Option<Captured>> {
         let targets = self.targets()?;
         if targets.is_empty() {
             return Ok(None);
@@ -276,34 +356,43 @@ impl Watcher {
             }
         }
 
-        let chosen = self
-            .atoms
-            .text_targets
-            .iter()
-            .copied()
-            .find(|t| targets.contains(t));
-        let Some(target) = chosen else {
-            return Ok(None); // image, file list, or some app-private format
-        };
-
-        let Some(bytes) = self.fetch(target)? else {
-            return Ok(None);
-        };
-        if bytes.len() > MAX_BYTES {
-            log::debug!("skipping {} byte clipboard payload", bytes.len());
-            return Ok(None);
+        // Text wins when both are offered: copying a file in a file manager or
+        // rich content in a browser offers an image alongside the text, and the
+        // text is what you actually wanted.
+        if let Some(target) = self.atoms.text_targets.iter().copied().find(|t| targets.contains(t))
+        {
+            let Some(bytes) = self.fetch(target)? else {
+                return Ok(None);
+            };
+            if bytes.len() > MAX_TEXT_BYTES {
+                log::debug!("skipping {} byte text payload", bytes.len());
+                return Ok(None);
+            }
+            // STRING is latin-1 by spec; everything else we ask for is UTF-8.
+            let text = if target == Atom::from(AtomEnum::STRING) {
+                bytes.iter().map(|&b| b as char).collect()
+            } else {
+                String::from_utf8_lossy(&bytes).into_owned()
+            };
+            return Ok(Some(Captured::Text(text)));
         }
 
-        // STRING is latin-1 by spec; everything else we ask for is UTF-8.
-        let text = if target == Atom::from(AtomEnum::STRING) {
-            bytes.iter().map(|&b| b as char).collect()
-        } else {
-            String::from_utf8_lossy(&bytes).into_owned()
-        };
-        Ok(Some(text))
+        if let Some(target) = self.atoms.image_targets.iter().copied().find(|t| targets.contains(t))
+        {
+            let Some(bytes) = self.fetch(target)? else {
+                return Ok(None);
+            };
+            if bytes.len() > MAX_IMAGE_BYTES {
+                log::debug!("skipping {} byte image payload", bytes.len());
+                return Ok(None);
+            }
+            return Ok(Some(Captured::Image(bytes)));
+        }
+
+        Ok(None) // file list or some app-private format
     }
 
-    fn run(&mut self, tx: Sender<String>, suppress: Arc<Suppressor>) -> Result<()> {
+    fn run(&mut self, tx: Sender<Captured>) -> Result<()> {
         loop {
             let event = self.next_event()?;
             let Event::XfixesSelectionNotify(e) = event else { continue };
@@ -316,21 +405,20 @@ impl Watcher {
             // ready to answer ConvertSelection.
             std::thread::sleep(Duration::from_millis(20));
 
-            let text = match self.read_text() {
-                Ok(Some(t)) => t,
+            let captured = match self.read_clip() {
+                Ok(Some(c)) => c,
                 Ok(None) => continue,
                 Err(err) => {
                     log::warn!("clipboard read failed: {err}");
                     continue;
                 }
             };
-            if text.trim().is_empty() {
-                continue;
+            if let Captured::Text(t) = &captured {
+                if t.trim().is_empty() {
+                    continue;
+                }
             }
-            if suppress.should_skip(&hash_of(&text)) {
-                continue;
-            }
-            if tx.send(text).is_err() {
+            if tx.send(captured).is_err() {
                 bail!("clipboard consumer went away");
             }
         }
@@ -338,13 +426,13 @@ impl Watcher {
 }
 
 /// Starts the watcher on its own thread with its own X connection.
-pub fn spawn(tx: Sender<String>, suppress: Arc<Suppressor>) {
+pub fn spawn(tx: Sender<Captured>) {
     std::thread::Builder::new()
         .name("clipboard-watcher".into())
         .spawn(move || match Watcher::new() {
             Ok(mut w) => {
                 log::info!("clipboard watcher running");
-                if let Err(e) = w.run(tx, suppress) {
+                if let Err(e) = w.run(tx) {
                     log::error!("clipboard watcher stopped: {e}");
                 }
             }
