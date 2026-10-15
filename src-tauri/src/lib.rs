@@ -193,8 +193,13 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("failed to start ClipVault")
         .run(|_app, event| {
-            if let tauri::RunEvent::ExitRequested { api, .. } = event {
-                api.prevent_exit();
+            if let tauri::RunEvent::ExitRequested { code, api, .. } = event {
+                // No exit code means the last window closed, which parks the app
+                // in the tray. An exit code means someone asked to quit, and
+                // blocking that is what made the tray's Quit do nothing.
+                if code.is_none() {
+                    api.prevent_exit();
+                }
             }
         });
 }

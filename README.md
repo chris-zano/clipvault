@@ -71,6 +71,12 @@ gsettings set org.gnome.shell.keybindings toggle-message-tray "[]"
 
 Closing the window parks it in the tray. Quit from the tray menu.
 
+To start it at login:
+
+```bash
+cp /usr/share/applications/ClipVault.desktop ~/.config/autostart/
+```
+
 ## Testing the watcher by hand
 
 `scripts/gtkcopy.py` and `scripts/gtkpaste.py` act as a real GTK clipboard owner
