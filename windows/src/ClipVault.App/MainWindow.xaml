@@ -1,0 +1,95 @@
+﻿<Window x:Class="ClipVault.App.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        xmlns:local="clr-namespace:ClipVault.App"
+        mc:Ignorable="d"
+        Title="ClipVault" Height="560" Width="760"
+        WindowStartupLocation="Manual" ShowInTaskbar="False"
+        Icon="Assets/icon.ico"
+        Background="{DynamicResource BgColor}"
+        PreviewKeyDown="OnPreviewKeyDown">
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <!-- header: tabs + search -->
+        <StackPanel Grid.Row="0" Margin="12,10,12,8">
+            <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                <ToggleButton x:Name="HistoryTabButton" Content="History" Padding="12,5" Margin="0,0,4,0"
+                              Click="OnHistoryTabClick" IsChecked="True"
+                              AutomationProperties.AutomationId="HistoryTabButton" />
+                <ToggleButton x:Name="VaultTabButton" Content="Vault" Padding="12,5" Click="OnVaultTabClick"
+                              AutomationProperties.AutomationId="VaultTabButton" />
+            </StackPanel>
+            <TextBox x:Name="SearchBox" Padding="9,8" FontSize="14" TextChanged="OnSearchChanged"
+                     AutomationProperties.AutomationId="SearchBox" />
+        </StackPanel>
+
+        <!-- content -->
+        <Grid Grid.Row="1" Margin="8,0,8,8">
+            <!-- History view -->
+            <Grid x:Name="HistoryView">
+                <TextBlock x:Name="HistoryEmptyText" Text="Nothing copied yet."
+                           HorizontalAlignment="Center" Margin="0,48,0,0"
+                           Foreground="{DynamicResource FgDimColor}" FontSize="13" Visibility="Collapsed"
+                           AutomationProperties.AutomationId="HistoryEmptyText" />
+                <ScrollViewer VerticalScrollBarVisibility="Auto">
+                    <StackPanel x:Name="HistoryList" />
+                </ScrollViewer>
+            </Grid>
+
+            <!-- Vault view -->
+            <Grid x:Name="VaultView" Visibility="Collapsed">
+                <!-- Gate: create/unlock -->
+                <StackPanel x:Name="VaultGatePanel" MaxWidth="320" HorizontalAlignment="Center" VerticalAlignment="Center">
+                    <TextBlock x:Name="GateTitleText" FontSize="16" FontWeight="SemiBold"
+                               HorizontalAlignment="Center" Foreground="{DynamicResource FgColor}" Margin="0,0,0,6"
+                               AutomationProperties.AutomationId="GateTitleText" />
+                    <TextBlock x:Name="GateHintText" TextWrapping="Wrap" TextAlignment="Center"
+                               Foreground="{DynamicResource FgDimColor}" FontSize="12.5" />
+                    <PasswordBox x:Name="GatePasswordBox" Margin="0,14,0,8" Padding="9"
+                                 AutomationProperties.AutomationId="GatePasswordBox" />
+                    <PasswordBox x:Name="GatePassword2Box" Margin="0,0,0,8" Padding="9"
+                                 AutomationProperties.AutomationId="GatePassword2Box" />
+                    <TextBlock x:Name="GateErrorText" Foreground="{DynamicResource DangerColor}"
+                               FontSize="12.5" TextWrapping="Wrap" MinHeight="18"
+                               AutomationProperties.AutomationId="GateErrorText" />
+                    <Button x:Name="GateSubmitButton" Click="OnGateSubmit" Padding="9,8" Margin="0,6,0,0"
+                            Background="{DynamicResource AccentColor}" Foreground="White" BorderThickness="0"
+                            IsDefault="True" AutomationProperties.AutomationId="GateSubmitButton" />
+                </StackPanel>
+
+                <!-- Open: the secrets list -->
+                <DockPanel x:Name="VaultOpenPanel" Visibility="Collapsed">
+                    <DockPanel DockPanel.Dock="Top" Margin="0,0,0,10" LastChildFill="False">
+                        <Button x:Name="VaultNewButton" Content="New" Click="OnVaultNewClick" DockPanel.Dock="Left"
+                                Padding="10,6" Margin="0,0,6,0" AutomationProperties.AutomationId="VaultNewButton" />
+                        <Button x:Name="VaultLockButton" Content="Lock" Click="OnVaultLockClick" DockPanel.Dock="Left"
+                                Padding="10,6" AutomationProperties.AutomationId="VaultLockButton" />
+                        <TextBlock x:Name="VaultTimerText" DockPanel.Dock="Right"
+                                   Foreground="{DynamicResource FgDimColor}" FontSize="11" VerticalAlignment="Center"
+                                   AutomationProperties.AutomationId="VaultTimerText" />
+                    </DockPanel>
+                    <TextBlock x:Name="VaultEmptyText" Text="No secrets yet." DockPanel.Dock="Top"
+                               HorizontalAlignment="Center" Foreground="{DynamicResource FgDimColor}"
+                               Margin="0,24,0,0" Visibility="Collapsed"
+                               AutomationProperties.AutomationId="VaultEmptyText" />
+                    <ScrollViewer VerticalScrollBarVisibility="Auto">
+                        <StackPanel x:Name="VaultList" />
+                    </ScrollViewer>
+                </DockPanel>
+            </Grid>
+        </Grid>
+
+        <!-- status line -->
+        <Border Grid.Row="2" BorderBrush="{DynamicResource LineColor}" BorderThickness="0,1,0,0" Padding="12,6">
+            <TextBlock x:Name="StatusText" Foreground="{DynamicResource FgDimColor}" FontSize="11"
+                       AutomationProperties.AutomationId="StatusText" />
+        </Border>
+    </Grid>
+</Window>

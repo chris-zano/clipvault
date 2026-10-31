@@ -3,6 +3,10 @@
 Clipboard history with an encrypted secrets vault, for X11 on Linux. Tauri v2:
 Rust daemon, TypeScript UI, 7.2 MB binary.
 
+A .NET 9 / WPF port for Windows lives in [`windows/`](windows/README.md) -
+same features, same database schema and vault crypto, independent build. See
+[`windows/PLAN.md`](windows/PLAN.md) for how it maps onto this codebase.
+
 Measured 137 MB resident at idle, because the WebView is created at startup even
 though the window stays hidden. Creating the window lazily on first open would
 cut idle usage to the Rust daemon alone; it is not done yet.
